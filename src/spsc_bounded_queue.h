@@ -56,8 +56,7 @@ public:
   spsc_bounded_queue& operator=(const spsc_bounded_queue&) = delete;
   spsc_bounded_queue& operator=(spsc_bounded_queue&&) = delete;
 
-  spsc_bounded_queue() : data_ (alloc_traits::allocate(alloc_, Cap)) {}
-  spsc_bounded_queue(Alloc& alloc) : alloc_(alloc), data_ (alloc_traits::allocate(alloc_, Cap)) {} 
+  spsc_bounded_queue(const Alloc& alloc = {}) : alloc_(alloc), data_ (alloc_traits::allocate(alloc_, Cap)), head_to_reach_(Cap) {} 
   ~spsc_bounded_queue() {
     while (true) {
       auto tail = can_pop();
@@ -174,19 +173,36 @@ private:
   }
 
   COLD_LF_FORCEINLINE [[nodiscard]] std::optional<std::uint64_t> can_push() {
-    auto current_head = head_.load(std::memory_order_acquire);
-    auto current_tail = tail_.load(std::memory_order_acquire);
-    if (current_head - current_tail >= Cap) {
-      return std::nullopt;
+    auto current_head = head_.load(std::memory_order_acquire);   
+    if (current_head == head_to_reach_) {
+      auto current_tail = tail_.load(std::memory_order_acquire);
+      // tail moved -> item popped
+      if (prev_tail_ != current_tail) {
+        auto r_t = get_remainder(current_tail);
+        auto r_h = get_remainder(current_head);
+
+        head_to_reach_ = r_h < r_t ? head_to_reach_ + (r_t - r_h) : head_to_reach_ + (Cap - r_h) + r_t;
+        prev_tail_ = current_tail;
+      } 
+      if (current_head == head_to_reach_) {
+        return std::nullopt;
+      }
     }
     return current_head;
   }
 
-  COLD_LF_FORCEINLINE [[nodiscard]] std::optional<std::uint64_t> can_pop() {
-    auto current_head = head_.load(std::memory_order_acquire);
+  COLD_LF_FORCEINLINE [[nodiscard]] std::optional<std::uint64_t> can_pop() { 
     auto current_tail = tail_.load(std::memory_order_acquire);
-    if (current_tail >= current_head) {
-      return std::nullopt;
+    if (current_tail == tail_to_reach_) {
+      auto current_head = head_.load(std::memory_order_acquire);
+      if (prev_head_ != current_head) {
+        tail_to_reach_ = current_head;
+        prev_head_ = current_head;
+      }
+      if (current_tail == tail_to_reach_) {
+        return std::nullopt;
+      }
+
     }
     return current_tail;
   }
@@ -216,6 +232,11 @@ private:
 private:
   alignas(CACHE_LINE_SIZE) std::atomic<std::uint64_t> head_ {};
   alignas(CACHE_LINE_SIZE) std::atomic<std::uint64_t> tail_ {};
+  alignas(CACHE_LINE_SIZE) std::uint64_t head_to_reach_{};
+  alignas(CACHE_LINE_SIZE) std::uint64_t prev_tail_ {};
+  alignas(CACHE_LINE_SIZE) std::uint64_t prev_head_ {};
+  alignas(CACHE_LINE_SIZE) std::uint64_t tail_to_reach_ {};
+
   
   alignas(CACHE_LINE_SIZE) ptr_t data_;
   [[no_unique_address]] alignas(CACHE_LINE_SIZE) Alloc alloc_ {};

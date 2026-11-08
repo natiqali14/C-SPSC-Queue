@@ -13,6 +13,7 @@ cold_lf::spsc_bounded_queue<std::uint64_t, 1024> q;   // 1024 slots, fixed at co
 - Header-only and lock-free
 - Fixed, power-of-two capacity with all slots usable
 - Custom allocators and a pluggable wait policy
+- Throughput in the same range as [Rigtorp's `SPSCQueue`](https://github.com/rigtorp/SPSCQueue), with wins on both sides depending on queue size and item type (see [Benchmarks](#benchmarks))
 
 ## Requirements
 
@@ -126,8 +127,10 @@ The queue is neither copyable nor movable. Its destructor destroys any items sti
 
 By default the `wait_and_*` functions spin as hard as they can (`spin_policy::pause()` does nothing). 
 ```cpp
+#include <immintrin.h>   // _mm_pause (x86 only)
+
 struct pause_policy {
-  static void pause() noexcept { CPU_RELAX(); }
+  static void pause() noexcept { _mm_pause(); }
 };
 
 cold_lf::spsc_bounded_queue<std::uint64_t, 1024, std::allocator<std::uint64_t>, 64, pause_policy> q;
@@ -156,23 +159,47 @@ ctest --test-dir build --output-on-failure
 The benchmark compares `cold_lf` with [Erik Rigtorp's `SPSCQueue`](https://github.com/rigtorp/SPSCQueue), a widely used, fast SPSC queue, as a baseline.
 
 ```bash
-./build/benchmarks/cold_lf_spsc_benchmark
+./build/benchmarks/cold_lf_spsc_benchmark [queue] [payload] [q_size]
 ```
 
-**Method (throughput):** a producer thread pushes 10,000,000 `std::uint64_t` items and a consumer thread pops them, with the two threads pinned to different cores. One timer covers the whole batch, and the result is items per second. This is repeated 100 times, and the min, median and max are reported. Timing the whole batch instead of every single push matters: a clock read costs ~20–50 ns, which is far more than one push.
+| Argument | Values | Default |
+|---|---|---|
+| `queue` | `rigtorp`, `cold_lf`, `both` | `both` |
+| `payload` | `8bit` (`std::uint8_t`), `64bit` (`std::uint64_t`), `big` (`payload_msg`, about 2 KB), `all` | `all` |
+| `q_size` | `1`, `8`, `64`, `256`, `1024`, `8192`, `32768` | `1024` |
 
-**Results:**
+For example, `./build/benchmarks/cold_lf_spsc_benchmark cold_lf 64bit 1024` runs only cold_lf, with `std::uint64_t` items and 1024 slots.
 
-| Queue | Min (M items/s) | Median (M items/s) | Max (M items/s) | ns per item (median) |
-|---|---|---|---|---|
-| cold_lf | 238.6 | 258.6 | 264.2 | 3.9 |
-| Rigtorp `SPSCQueue` | 425.2 | 450.4 | 453.4 | 2.2 |
+**Method (throughput):** the producer and consumer threads are pinned to two different cores. In one run the producer pushes a fixed number of items (1,000,000 for `8bit` and `64bit`, 100,000 for `big`), and the consumer pops every item and copies it out. One timer covers the whole run, from the producer's first push to the consumer's last pop, and throughput = items / time. Timing a whole run instead of every single push matters: a clock read costs ~20–50 ns, which is far more than one push. Before each run the producer waits until the consumer is ready, so thread start-up is never timed. Each case does 200 runs, drops the first 10 as warmup, and reports min, p10, median, p90 and max in millions of items per second.
 
-Conditions: Intel Core Ultra 5 225H, Linux, GCC 15.2, Release build, laptop in performance power mode, producer on core 0 and consumer on core 3 (both performance cores), queue capacity 65,536.
+The core numbers (`PRODUCER_CORE`, `CONSUMER_CORE`) are hard-coded in `benchmarks/benchmark.cpp`. Change them if your machine has fewer cores or a different layout.
 
-Rigtorp's queue is currently about **1.74× - 2.2x faster**. That ratio held steady across power modes even when the raw numbers changed by more than 2×. Finding out where the gap comes from is ongoing work.
+### Running every combination
 
-The core numbers are hard-coded in `benchmarks/benchmark.cpp`. Change them if your machine has fewer cores or a different layout.
+```bash
+benchmarks/run_benchmarks.sh
+```
+
+This runs every queue size and payload, first with Rigtorp and then with cold_lf, each in its own process. It writes two files to `benchmark_results/`:
+
+- `<date_time>_results.csv`: one line per run, followed by a table that says which queue had the higher median for every queue size and payload.
+- `<date_time>_full.log`: everything the benchmark printed.
+
+### Results
+
+**In short: cold_lf's throughput is in the same range as Rigtorp's `SPSCQueue`.** Neither queue is faster in every case. Rigtorp is faster with a 1-slot queue and in a few `std::uint64_t` cases. cold_lf is faster for small items in several of the larger queue sizes. With ~2 KB items the two are within a few percent of each other.
+
+Two runs of the script on a Linux server. This table only lists cases where the same queue won both times:
+
+| Payload | Queue size | Faster |
+|---|---|---|
+| `8bit`, `64bit`, `big` | 1 | Rigtorp (7–69%) |
+| `64bit` | 64, 1024 | Rigtorp (19–115%) |
+| `8bit` | 256, 1024, 32768 | cold_lf (23–153%) |
+| `64bit` | 8192, 32768 | cold_lf (40–85%) |
+| `big` | 8 and larger | Tie (within ~6%) |
+
+The other cases changed winner between the two runs. Some medians moved by up to 2× between runs, so treat the percentages as rough. Results also depend on the CPU: on an Intel Core Ultra 5 225H laptop, cold_lf was slightly faster at queue size 1. Run the script a few times on your own machine before drawing conclusions.
 
 ## Project layout
 
@@ -183,21 +210,15 @@ The core numbers are hard-coded in `benchmarks/benchmark.cpp`. Change them if yo
 ├── README.md
 ├── src/
 │   ├── spsc_bounded_queue.h   the queue
-│   ├── defines.h              integer aliases, COLD_LF_FORCEINLINE, CPU_RELAX
 │   └── utils.h                pin_thread and test payload types
 ├── tests/
 │   └── test_spsc_bounded_lf.cpp
 └── benchmarks/
     ├── benchmark.cpp
     ├── benchmark_util.h       timer and statistics helpers
+    ├── run_benchmarks.sh      runs every combination, saves results
     └── rigtorp_queue.h        third-party baseline (MIT)
 ```
-
-## Roadmap
-
-- [ ] Find out why cold_lf's throughput is ~1.74× lower than Rigtorp's `SPSCQueue`
-- [ ] Add a round-trip latency benchmark
-- [ ] Benchmark with larger payloads (`payload_msg`)
 
 ## License
 

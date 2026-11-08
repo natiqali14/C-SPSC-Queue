@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <gtest/gtest.h>
 #include <spsc_bounded_queue.h>
 #include <thread>
@@ -68,6 +69,7 @@ TEST(SpscBoundedLfQ, QCopyConstruction) {
   cold_lf::spsc_bounded_queue<cold_lf::move_copy, 2> q;
   cold_lf::move_copy mc;
   auto success = q.try_push(mc);
+  EXPECT_TRUE(success);
   auto *const mc_ref = q.front();
   EXPECT_TRUE(mc_ref != nullptr);
   EXPECT_EQ(mc_ref->copy_constructed_, true);
@@ -155,13 +157,18 @@ TEST_F(SpscBoundedQueueDestructionTest, QDestruction) {
 //////////////////////////////////////////  TYPED TESTS  //////////////////////////////////////////
 template<typename Tp>
 void check_for_consumed_items(std::unordered_map<std::uint64_t, Tp>& consumed_items, std::uint64_t ITER) {
+  uint64_t t {};
   for (std::uint64_t i {}; i < ITER; i++) {
     auto it = consumed_items.find(i);
     EXPECT_TRUE(it != consumed_items.end());
-    if (it == consumed_items.end()) continue;
     auto data = TestValue<Tp>::make(i);
+    if constexpr (std::is_same_v<Tp, std::uint64_t>) {
+      if (data != it->second) t++; 
+    }
+    
     EXPECT_TRUE(data == it->second);
   }
+  std::cout << "total wrong " << t << "\n";
 }
 
 TYPED_TEST(SpscBoundedQueueTest, StressConcurrencyTestWithLValAndTry) {
